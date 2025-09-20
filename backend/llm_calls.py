@@ -1,14 +1,13 @@
 from typing import List, Dict
 import os
 import json
-from openai import OpenAI
+from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(
+client = Groq(
     api_key=os.getenv("GROQ_API_KEY", os.getenv("GROK_API_KEY", "your_groq_api_key_here")),
-    base_url="https://api.groq.com/openai/v1",
 )
 
 async def generate_seed_keywords(url: str) -> List[str]:
