@@ -4,18 +4,12 @@ import api_endpoints
 
 app = FastAPI(title="SEM Planning Engine API")
 
-# Configure CORS (Cross-Origin Resource Sharing)
-# This allows the React frontend (running on a different port)
-# to communicate with the FastAPI backend.
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8000",
     "http://localhost:8000",
-    "https://*.railway.app",
-    "https://*.vercel.app",
-    "https://*.netlify.app",
-    "*"  # Allow all origins for deployment (you can restrict this later)
+    "https://*.railway.app"
 ]
 
 app.add_middleware(

@@ -5,8 +5,7 @@ developer_token: "fH_87373gKgly0DoHq_RqA"
 client_id: "1008665885039-akmm0gk3qu6mcrbsvhfsobpeh5gl60hr.apps.googleusercontent.com"
 client_secret: "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"
 
-# Refresh token (you'll need to generate this through OAuth2 flow)
-# To generate a refresh token, run: python -m google.ads.googleads.examples.authentication.generate_refresh_token
+# Refresh token
 refresh_token: "1//0gsrBzl7cE_VBCgYIARAAGBASNwF-L9IrUpMPamxpXhD0yuPGQ-Bc34-iPHTYuNPzS2YRKO399UdzA--yq6FbMoytWM1u6R0YXNs"
 
 # Default customer ID (without dashes)
