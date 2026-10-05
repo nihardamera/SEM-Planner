@@ -1,28 +1,34 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import api_endpoints
+import logging
+import os
+from pathlib import Path
 
-app = FastAPI(title="SEM Planning Engine API")
+from dotenv import load_dotenv
 
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:8000",
-    "http://localhost:8000",
-    "https://*.railway.app"
-]
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+import api_endpoints  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173"
+
+app = FastAPI(title="SEM Planner API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_origins=[
+        origin.strip() for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",") if origin.strip()
+    ],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
-# Include the API router
 app.include_router(api_endpoints.router, prefix="/api/v1")
 
+
 @app.get("/", tags=["Root"])
-async def read_root():
-    return {"message": "Welcome to the SEM Planning Engine API"}
+def read_root() -> dict:
+    return {"message": "SEM Planner API. See /docs for the endpoints."}

@@ -1,238 +1,203 @@
-import random
-from typing import List, Dict
-from url_checker import analyze_url_content
-from models import PlanRequest, PlanResponse, SearchCampaignPlan, PMaxPlan, ShoppingCampaignPlan, AdGroup
-from llm_calls import generate_seed_keywords, cluster_keywords, generate_pmax_themes
-from keywords import get_keyword_ideas_1, get_keyword_ideas_2
+"""Builds the plan.
 
-async def generate_full_sem_plan(request: PlanRequest) -> PlanResponse:
-    try:
-        if not await analyze_url_content(request.brand_url):
-            seed_keywords = await generate_seed_keywords(request.brand_url)
-        else:
-            seed_keywords = await get_keyword_ideas_1(request.brand_url)
+Division of work:
+- Keyword Planner (or, in estimated mode, estimates.py) supplies search
+  volumes, competition and top-of-page bids.
+- rank_keywords() ranks keywords with a fixed weighted score.
+- The language model groups the ranked keywords into named ad groups and
+  writes Performance Max themes. It also suggests seed keywords when the
+  brand page is too thin for a Keyword Planner URL seed, or when Keyword
+  Planner is unavailable.
+- CPC ranges are averages of Keyword Planner bids, and the Shopping bid is
+  a formula. The model never sets a number.
+"""
 
-        keyword_ideas = await get_keyword_ideas_2(seed_keywords, request.competitor_url)
-        print("✅ Using Google Ads API data")
+import logging
+from typing import Callable, Dict, List, Sequence
 
-    except Exception as e:
-        error_msg = str(e)
-        if "DEVELOPER_TOKEN_NOT_APPROVED" in error_msg:
-            print("⚠️  Developer token not approved for production. Using mock data.")
-            print("💡 Apply for Basic/Standard access at: https://developers.google.com/google-ads/api/docs/access-levels")
-        else:
-            print(f"⚠️  Google Ads API error: {error_msg}")
+import estimates
+import keyword_planner
+import llm_calls
+from models import (
+    AdGroup,
+    KeywordMetrics,
+    PlanRequest,
+    PlanResponse,
+    PMaxPlan,
+    Ranking,
+    SearchCampaignPlan,
+    ShoppingCampaignPlan,
+)
+from url_checker import fetch_page_text, is_content_rich
 
-        print("🔄 Generating comprehensive mock SEM plan...")
-        return await generate_mock_sem_plan(request)
+logger = logging.getLogger(__name__)
 
-    filtered_keywords = [kw for kw in keyword_ideas if kw['avg_monthly_searches'] >= 500]
+# Ranking: score = 0.4 * volume + 0.4 * bid - 0.2 * competition, each term
+# min-max normalised to 0..1 across the keywords that pass the volume filter.
+MIN_AVG_MONTHLY_SEARCHES = 500
+MAX_RANKED_KEYWORDS = 50
+WEIGHT_VOLUME = 0.4
+WEIGHT_BID = 0.4
+WEIGHT_COMPETITION = 0.2
 
-    if not filtered_keywords:
-        pruned_keywords = []
-    else:
-        volumes = [kw['avg_monthly_searches'] for kw in filtered_keywords]
-        bids = [((kw['low_top_of_page_bid'] + kw['high_top_of_page_bid']) / 2) for kw in filtered_keywords]
-        competitions = [kw['competition_index'] for kw in filtered_keywords]
+SUGGESTED_MATCH_TYPES = ["Phrase", "Exact"]
+UNGROUPED_AD_GROUP = "Ungrouped keywords"
 
-        min_vol, max_vol = min(volumes), max(volumes)
-        min_bid, max_bid = min(bids), max(bids)
-        min_comp, max_comp = min(competitions), max(competitions)
+# Share of Shopping clicks assumed to end in a sale. This is an assumption,
+# not a figure from any account; change it here if you know your own rate.
+ASSUMED_CONVERSION_RATE = 0.02
 
-        def normalize(val, min_val, max_val):
-            return (val - min_val) / (max_val - min_val) if max_val > min_val else 0.0
 
-        w1, w2, w3 = 0.4, 0.4, 0.2
+def _average_bid(keyword: Dict) -> float:
+    return (keyword["low_top_of_page_bid"] + keyword["high_top_of_page_bid"]) / 2
 
-        for kw in filtered_keywords:
-            norm_vol = normalize(kw['avg_monthly_searches'], min_vol, max_vol)
-            avg_bid = (kw['low_top_of_page_bid'] + kw['high_top_of_page_bid']) / 2
-            norm_bid = normalize(avg_bid, min_bid, max_bid)
-            norm_comp = normalize(kw['competition_index'], min_comp, max_comp)
-            kw['roas_score'] = (w1 * norm_vol) + (w2 * norm_bid) - (w3 * norm_comp)
 
-        pruned_keywords = sorted(filtered_keywords, key=lambda x: x['roas_score'], reverse=True)[:50]
-    
-    keyword_texts = [kw['text'] for kw in pruned_keywords]
+def _normaliser(values: Sequence[float]) -> Callable[[float], float]:
+    low, high = min(values), max(values)
+    if high == low:
+        return lambda value: 0.0
+    return lambda value: (value - low) / (high - low)
 
-    clustered_ad_groups = await cluster_keywords(keyword_texts)
 
-    search_ad_groups = []
-    for group_name, keywords in clustered_ad_groups.items():
-        group_keyword_data = [kw for kw in pruned_keywords if kw['text'] in keywords]
-        if not group_keyword_data:
-            continue
-        low_bids = [kw['low_top_of_page_bid'] for kw in group_keyword_data]
-        high_bids = [kw['high_top_of_page_bid'] for kw in group_keyword_data]
-        avg_low_bid = sum(low_bids) / len(low_bids)
-        avg_high_bid = sum(high_bids) / len(high_bids)
-        
-        ad_group = AdGroup(
-            ad_group_name=group_name,
-            theme=f"Theme related to {keywords}",
-            keywords=keywords,
-            suggested_match_types=["Phrase", "Exact"],
-            suggested_cpc_range=f"${avg_low_bid:.2f} - ${avg_high_bid:.2f}"
+def rank_keywords(ideas: List[Dict]) -> List[Dict]:
+    """Filter by volume, score, and return the top MAX_RANKED_KEYWORDS (highest score first)."""
+    eligible = [idea for idea in ideas if idea["avg_monthly_searches"] >= MIN_AVG_MONTHLY_SEARCHES]
+    if not eligible:
+        return []
+
+    volume = _normaliser([idea["avg_monthly_searches"] for idea in eligible])
+    bid = _normaliser([_average_bid(idea) for idea in eligible])
+    competition = _normaliser([idea["competition_index"] for idea in eligible])
+
+    scored = []
+    for idea in eligible:
+        score = (
+            WEIGHT_VOLUME * volume(idea["avg_monthly_searches"])
+            + WEIGHT_BID * bid(_average_bid(idea))
+            - WEIGHT_COMPETITION * competition(idea["competition_index"])
         )
-        search_ad_groups.append(ad_group)
+        scored.append({**idea, "score": round(score, 4)})
 
-    search_plan = SearchCampaignPlan(ad_groups=search_ad_groups)
+    scored.sort(key=lambda idea: (-idea["score"], idea["text"].lower()))
+    return scored[:MAX_RANKED_KEYWORDS]
 
-    ad_group_themes = [ag.theme for ag in search_ad_groups]
-    pmax_themes = await generate_pmax_themes(ad_group_themes)
-    pmax_plan = PMaxPlan(search_themes=pmax_themes)
 
-    target_roas_ratio = request.target_roas_percentage / 100.0
-    target_cpa = request.average_product_price / target_roas_ratio
-    conversion_rate = 0.02
-    
-    target_cpc = target_cpa * conversion_rate
-    
-    explanation_text = (
-        f"Based on an average product price of ${request.average_product_price:.2f} and a "
-        f"target ROAS of {request.target_roas_percentage}%, your allowable ad spend per sale (Target CPA) "
-        f"is ${target_cpa:.2f}. With an assumed 2% conversion rate, the suggested Target CPC is calculated "
-        f"to be profitable while meeting your ROAS goal."
+def _ad_group(name: str, members: List[Dict]) -> AdGroup:
+    members = sorted(members, key=lambda keyword: (-keyword["score"], keyword["text"].lower()))
+    return AdGroup(
+        ad_group_name=name,
+        keywords=[KeywordMetrics(**keyword) for keyword in members],
+        suggested_match_types=list(SUGGESTED_MATCH_TYPES),
+        cpc_range_low=round(sum(k["low_top_of_page_bid"] for k in members) / len(members), 2),
+        cpc_range_high=round(sum(k["high_top_of_page_bid"] for k in members) / len(members), 2),
     )
 
-    shopping_plan = ShoppingCampaignPlan(
+
+def build_ad_groups(clusters: Dict[str, List[str]], ranked: List[Dict]) -> List[AdGroup]:
+    """Join the model's groups to the ranked keyword metrics.
+
+    Keywords the model invented or altered are dropped, a keyword listed in
+    several groups stays in the first one, and ranked keywords the model left
+    out are collected in an "Ungrouped keywords" group.
+    """
+    by_text = {keyword["text"].lower(): keyword for keyword in ranked}
+    assigned = set()
+    groups: List[AdGroup] = []
+    for name, texts in clusters.items():
+        members = []
+        for text in texts:
+            key = " ".join(text.split()).lower()
+            if key in by_text and key not in assigned:
+                assigned.add(key)
+                members.append(by_text[key])
+        if members:
+            groups.append(_ad_group(name, members))
+
+    leftover = [keyword for keyword in ranked if keyword["text"].lower() not in assigned]
+    if leftover:
+        groups.append(_ad_group(UNGROUPED_AD_GROUP, leftover))
+    return groups
+
+
+def shopping_bid(
+    average_product_price: float,
+    target_roas_percentage: float,
+    conversion_rate: float = ASSUMED_CONVERSION_RATE,
+) -> ShoppingCampaignPlan:
+    """Target CPA = price / (ROAS / 100); target CPC = target CPA x conversion rate."""
+    roas_ratio = target_roas_percentage / 100.0
+    target_cpa = average_product_price / roas_ratio
+    target_cpc = target_cpa * conversion_rate
+    explanation = (
+        f"Target CPA = average product price / (target ROAS / 100) = "
+        f"${average_product_price:.2f} / {roas_ratio:.2f} = ${target_cpa:.2f}. "
+        f"Suggested target CPC = target CPA x assumed conversion rate = "
+        f"${target_cpa:.2f} x {conversion_rate:.1%} = ${target_cpc:.2f}. "
+        f"The {conversion_rate:.1%} conversion rate is an assumption, not a figure from your account."
+    )
+    return ShoppingCampaignPlan(
+        average_product_price=average_product_price,
+        target_roas_percentage=target_roas_percentage,
+        assumed_conversion_rate=conversion_rate,
         target_cpa=round(target_cpa, 2),
         suggested_target_cpc=round(target_cpc, 2),
-        explanation=explanation_text
+        explanation=explanation,
+    )
+
+
+def generate_full_sem_plan(request: PlanRequest) -> PlanResponse:
+    """Build the plan. Raises llm_calls.LLMError if a language model call fails."""
+    page_text = fetch_page_text(request.brand_url)
+
+    seeds: List[str] = []
+    seed_source = "keyword_planner"
+    data_source = "keyword_planner"
+    estimated_reason = None
+
+    try:
+        planner = keyword_planner.KeywordPlanner.from_config()
+        if is_content_rich(page_text):
+            seeds = keyword_planner.cap_seeds(planner.ideas_from_url(request.brand_url))
+        if not seeds:
+            seeds = keyword_planner.cap_seeds(llm_calls.generate_seed_keywords(request.brand_url, page_text))
+            seed_source = "language_model"
+        ideas = planner.ideas_from_seeds(seeds, request.competitor_url)
+    except keyword_planner.KeywordPlannerError as exc:
+        data_source = "estimated"
+        estimated_reason = str(exc)
+        logger.warning("Using estimated data: %s", estimated_reason)
+        if not seeds:
+            seeds = keyword_planner.cap_seeds(llm_calls.generate_seed_keywords(request.brand_url, page_text))
+            seed_source = "language_model"
+        ideas = estimates.estimate_keyword_metrics(seeds, request.brand_url, request.competitor_url)
+
+    ranked = rank_keywords(ideas)
+
+    ad_groups: List[AdGroup] = []
+    themes: List[str] = []
+    if ranked:
+        clusters = llm_calls.cluster_keywords([keyword["text"] for keyword in ranked])
+        ad_groups = build_ad_groups(clusters, ranked)
+        themes = llm_calls.generate_pmax_themes(
+            {group.ad_group_name: [keyword.text for keyword in group.keywords] for group in ad_groups}
+        )
+
+    ranking = Ranking(
+        min_avg_monthly_searches=MIN_AVG_MONTHLY_SEARCHES,
+        max_keywords=MAX_RANKED_KEYWORDS,
+        weight_volume=WEIGHT_VOLUME,
+        weight_bid=WEIGHT_BID,
+        weight_competition=WEIGHT_COMPETITION,
+        candidates=len(ideas),
+        kept=len(ranked),
     )
 
     return PlanResponse(
-        search_campaign_plan=search_plan,
-        pmax_plan=pmax_plan,
-        shopping_campaign_plan=shopping_plan
-    )
-
-
-async def generate_mock_sem_plan(request: PlanRequest) -> PlanResponse:
-    try:
-        seed_keywords = await generate_seed_keywords(request.brand_url)
-    except Exception as e:
-        print(f"⚠️  AI API quota exceeded. {e}")
-        return
-
-    mock_keywords = []
-    base_keywords = seed_keywords[:20]
-
-    for keyword in base_keywords:
-        keyword_length = len(keyword.split())
-
-        if keyword_length == 1:
-            volume = random.randint(5000, 50000)
-            competition = random.uniform(0.6, 0.9)
-            low_bid = random.uniform(1.0, 3.0)
-            high_bid = random.uniform(3.0, 8.0)
-        elif keyword_length == 2:
-            volume = random.randint(1000, 15000)
-            competition = random.uniform(0.4, 0.7)
-            low_bid = random.uniform(0.8, 2.5)
-            high_bid = random.uniform(2.5, 6.0)
-        else:
-            volume = random.randint(100, 5000)
-            competition = random.uniform(0.2, 0.5)
-            low_bid = random.uniform(0.5, 2.0)
-            high_bid = random.uniform(2.0, 4.0)
-
-        mock_keywords.append({
-            'text': keyword,
-            'avg_monthly_searches': volume,
-            'low_top_of_page_bid': low_bid,
-            'high_top_of_page_bid': high_bid,
-            'competition_index': competition
-        })
-
-    brand_name = request.brand_url.replace('https://', '').replace('http://', '').replace('www.', '').split('.')[0]
-    branded_keywords = [
-        f"{brand_name}",
-        f"{brand_name} shoes",
-        f"{brand_name} sneakers",
-        f"{brand_name} store",
-        f"buy {brand_name}"
-    ]
-
-    for keyword in branded_keywords:
-        mock_keywords.append({
-            'text': keyword,
-            'avg_monthly_searches': random.randint(500, 8000),
-            'low_top_of_page_bid': random.uniform(0.3, 1.5),
-            'high_top_of_page_bid': random.uniform(1.5, 3.5),
-            'competition_index': random.uniform(0.8, 1.0)
-        })
-
-    volumes = [kw['avg_monthly_searches'] for kw in mock_keywords]
-    bids = [(kw['low_top_of_page_bid'] + kw['high_top_of_page_bid']) / 2 for kw in mock_keywords]
-    competitions = [kw['competition_index'] for kw in mock_keywords]
-
-    min_vol, max_vol = min(volumes), max(volumes)
-    min_bid, max_bid = min(bids), max(bids)
-    min_comp, max_comp = min(competitions), max(competitions)
-
-    def normalize(val, min_val, max_val):
-        return (val - min_val) / (max_val - min_val) if max_val > min_val else 0.0
-
-    w1, w2, w3 = 0.4, 0.4, 0.2
-
-    for kw in mock_keywords:
-        norm_vol = normalize(kw['avg_monthly_searches'], min_vol, max_vol)
-        avg_bid = (kw['low_top_of_page_bid'] + kw['high_top_of_page_bid']) / 2
-        norm_bid = normalize(avg_bid, min_bid, max_bid)
-        norm_comp = normalize(kw['competition_index'], min_comp, max_comp)
-        kw['roas_score'] = (w1 * norm_vol) + (w2 * norm_bid) - (w3 * norm_comp)
-
-    top_keywords = sorted(mock_keywords, key=lambda x: x['roas_score'], reverse=True)[:25]
-    keyword_texts = [kw['text'] for kw in top_keywords]
-
-    clustered_ad_groups = await cluster_keywords(keyword_texts)
-
-    search_ad_groups = []
-    for group_name, keywords in clustered_ad_groups.items():
-        group_keyword_data = [kw for kw in top_keywords if kw['text'] in keywords]
-        if not group_keyword_data:
-            continue
-
-        low_bids = [kw['low_top_of_page_bid'] for kw in group_keyword_data]
-        high_bids = [kw['high_top_of_page_bid'] for kw in group_keyword_data]
-        avg_low_bid = sum(low_bids) / len(low_bids)
-        avg_high_bid = sum(high_bids) / len(high_bids)
-
-        ad_group = AdGroup(
-            ad_group_name=group_name,
-            theme=f"Targeting customers interested in {group_name.lower()}",
-            keywords=keywords,
-            suggested_match_types=["Phrase", "Exact", "Broad Match Modified"],
-            suggested_cpc_range=f"${avg_low_bid:.2f} - ${avg_high_bid:.2f}"
-        )
-        search_ad_groups.append(ad_group)
-
-    search_plan = SearchCampaignPlan(ad_groups=search_ad_groups)
-    ad_group_themes = [ag.theme for ag in search_ad_groups]
-    pmax_themes = await generate_pmax_themes(ad_group_themes)
-    pmax_plan = PMaxPlan(search_themes=pmax_themes)
-
-    target_roas_ratio = request.target_roas_percentage / 100.0
-    target_cpa = request.average_product_price / target_roas_ratio
-    conversion_rate = 0.02
-    target_cpc = target_cpa * conversion_rate
-
-    explanation_text = (
-        f"📊 MOCK DATA: Based on an average product price of ${request.average_product_price:.2f} and a "
-        f"target ROAS of {request.target_roas_percentage}%, your allowable ad spend per sale (Target CPA) "
-        f"is ${target_cpa:.2f}. With an estimated 2.5% conversion rate, the suggested Target CPC is "
-        f"${target_cpc:.2f}. This mock plan provides realistic estimates for planning purposes."
-    )
-
-    shopping_plan = ShoppingCampaignPlan(
-        target_cpa=round(target_cpa, 2),
-        suggested_target_cpc=round(target_cpc, 2),
-        explanation=explanation_text
-    )
-
-    return PlanResponse(
-        search_campaign_plan=search_plan,
-        pmax_plan=pmax_plan,
-        shopping_campaign_plan=shopping_plan
+        data_source=data_source,
+        estimated_reason=estimated_reason,
+        seed_keywords=seeds,
+        seed_source=seed_source,
+        search_campaign_plan=SearchCampaignPlan(ad_groups=ad_groups, ranking=ranking),
+        pmax_plan=PMaxPlan(search_themes=themes),
+        shopping_campaign_plan=shopping_bid(request.average_product_price, request.target_roas_percentage),
     )
