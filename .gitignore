@@ -1,1 +1,20 @@
+# Secrets and local configuration
 .env
+.env.*
+!.env.example
+backend/google-ads.yaml
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / Vite
+node_modules/
+dist/
+
+# OS
+.DS_Store

@@ -1,0 +1,24 @@
+# Google Ads API client configuration for Keyword Planner requests.
+#
+# Copy this file to backend/google-ads.yaml and replace every placeholder.
+# backend/google-ads.yaml is listed in .gitignore. Never commit it.
+#
+# Without this file the backend runs in estimated-data mode.
+# Field reference: https://developers.google.com/google-ads/api/docs/client-libs/python/configuration
+
+# Developer token from the API Center of a Google Ads manager account.
+# A token with only test-account access is rejected for production accounts
+# (DEVELOPER_TOKEN_NOT_APPROVED) and the backend falls back to estimated data.
+developer_token: REPLACE_WITH_DEVELOPER_TOKEN
+
+# OAuth2 client created in Google Cloud Console, plus a refresh token for a
+# user with access to the Google Ads account.
+client_id: REPLACE_WITH_OAUTH_CLIENT_ID.apps.googleusercontent.com
+client_secret: REPLACE_WITH_OAUTH_CLIENT_SECRET
+refresh_token: REPLACE_WITH_OAUTH_REFRESH_TOKEN
+
+# Manager account ID, 10 digits without dashes. Needed when you access the
+# client account through a manager account; remove the line otherwise.
+login_customer_id: "1234567890"
+
+use_proto_plus: True
