@@ -1,8 +1,7 @@
 import { useState } from 'react';
-import './app.css';
-import InputForm from './inputform.jsx';
-import ResultsDisplay from './resultsdisplay.jsx';
-import LoadingSpinner from './loadingspinner.jsx';
+import InputForm from './InputForm.jsx';
+import ResultsDisplay from './ResultsDisplay.jsx';
+import LoadingSpinner from './LoadingSpinner.jsx';
 import { generatePlan } from './PlanApi.js';
 
 function App() {
@@ -16,11 +15,9 @@ function App() {
     setResults(null);
 
     try {
-      const data = await generatePlan(formData);
-      setResults(data);
+      setResults(await generatePlan(formData));
     } catch (err) {
-      setError('Failed to generate plan. Please check the backend server and try again.');
-      console.error(err);
+      setError(err.message || 'The plan could not be generated.');
     } finally {
       setIsLoading(false);
     }
@@ -29,18 +26,22 @@ function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <h1>AI-Powered SEM Planning Engine</h1>
-        <p>Enter your brand details to generate a comprehensive multi-channel SEM strategy.</p>
+        <h1>SEM Planner</h1>
+        <p>
+          Drafts a Google Ads plan for Search, Performance Max and Shopping campaigns from a brand website, a
+          competitor website, a product price and a target ROAS.
+        </p>
       </header>
       <main>
         <InputForm onSubmit={handleFormSubmit} isLoading={isLoading} />
         {isLoading && <LoadingSpinner />}
-        {error && <div className="error-message">{error}</div>}
+        {error && (
+          <div className="error-message" role="alert">
+            {error}
+          </div>
+        )}
         {results && <ResultsDisplay results={results} />}
       </main>
-      <footer>
-        <p>Developed by an AI Writing Assistant</p>
-      </footer>
     </div>
   );
 }
